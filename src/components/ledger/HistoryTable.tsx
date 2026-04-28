@@ -137,11 +137,11 @@ export function HistoryTable({ periods, ticker }: { periods: Period[]; ticker: s
           </thead>
           <tbody>
             {SECTIONS.map((s, si) => (
-              <>
-                <tr key={`sec-${si}`} className="bg-secondary/20">
+              <Fragment key={`sec-${si}`}>
+                <tr className="bg-secondary/20">
                   <td
                     colSpan={periods.length + 1}
-                    className="px-4 py-1.5 text-[11px] uppercase tracking-wider text-primary font-semibold"
+                    className="px-4 py-1.5 text-[11px] uppercase tracking-wider text-primary font-semibold sticky left-0 bg-secondary/40"
                   >
                     {s.title}
                   </td>
@@ -174,7 +174,7 @@ export function HistoryTable({ periods, ticker }: { periods: Period[]; ticker: s
                     })}
                   </tr>
                 ))}
-              </>
+              </Fragment>
             ))}
           </tbody>
         </table>
