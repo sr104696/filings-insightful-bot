@@ -1,6 +1,13 @@
 // SEC EDGAR financial extractor
 // Fetches XBRL company-facts + recent submissions (10-K, 10-Q, 8-K, DEF 14A)
 // and returns a snapshot + multi-period table for the requested ticker.
+//
+// Period model (v2):
+// XBRL company-facts contain MANY facts per filing — a 10-Q includes 3-month
+// current quarter + 9-month YTD + prior-year comparatives. The filer-reported
+// `fy`/`fp` describe the FILING that supplied the fact, not the fact's period.
+// We therefore classify each fact by its actual (start, end, duration) and
+// dedupe by picking the most recently filed value for each canonical period.
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -8,7 +15,6 @@ const corsHeaders = {
     "authorization, x-client-info, apikey, content-type",
 };
 
-// SEC requires a descriptive User-Agent on every request.
 const UA = "Ledger Lovable App contact@example.com";
 
 type FactUnit = {
@@ -32,11 +38,12 @@ type CompanyFacts = {
 };
 
 type Period = {
-  key: string; // e.g. FY2023 or Q3-2024
+  key: string;
   label: string;
   fy: number;
   fp: string; // FY | Q1 | Q2 | Q3 | Q4
   end: string;
+  start: string | null;
   form: string;
   values: Record<string, number | null>;
 };
@@ -45,17 +52,17 @@ type Period = {
 
 async function secFetch(url: string): Promise<Response> {
   return fetch(url, {
-    headers: {
-      "User-Agent": UA,
-      Accept: "application/json, text/html",
-    },
+    headers: { "User-Agent": UA, Accept: "application/json, text/html" },
   });
 }
 
 async function resolveCik(ticker: string): Promise<{ cik: string; name: string } | null> {
   const res = await secFetch("https://www.sec.gov/files/company_tickers.json");
   if (!res.ok) return null;
-  const data = await res.json() as Record<string, { cik_str: number; ticker: string; title: string }>;
+  const data = (await res.json()) as Record<
+    string,
+    { cik_str: number; ticker: string; title: string }
+  >;
   const upper = ticker.toUpperCase();
   for (const k of Object.keys(data)) {
     if (data[k].ticker === upper) {
@@ -68,7 +75,10 @@ async function resolveCik(ticker: string): Promise<{ cik: string; name: string }
   return null;
 }
 
-// Pick the unit array we want (USD by default, shares for share counts)
+// Merge units from ALL matching concept synonyms — filers sometimes switch
+// tags between filings (e.g. Alphabet moved from
+// RevenueFromContractWithCustomerExcludingAssessedTax to Revenues mid-2025).
+// Dedup by (start|end) keeping the most recently filed value.
 function pickUnits(
   facts: CompanyFacts,
   conceptCandidates: string[],
@@ -76,56 +86,49 @@ function pickUnits(
 ): FactUnit[] {
   const ns = facts.facts["us-gaap"] ?? {};
   const dei = facts.facts.dei ?? {};
+  const merged = new Map<string, FactUnit>();
   for (const c of conceptCandidates) {
     const node = ns[c] ?? dei[c];
     if (!node) continue;
+    let unitArr: FactUnit[] | undefined;
     for (const u of preferredUnits) {
-      if (node.units[u]) return node.units[u];
+      if (node.units[u]) {
+        unitArr = node.units[u];
+        break;
+      }
     }
-    // fall back to first unit available
-    const firstKey = Object.keys(node.units)[0];
-    if (firstKey) return node.units[firstKey];
-  }
-  return [];
-}
-
-// Group filings by (fy, fp) and end date
-function groupPeriods(units: FactUnit[]): Map<string, FactUnit> {
-  const out = new Map<string, FactUnit>();
-  for (const u of units) {
-    if (!u.fy || !u.fp || !u.form) continue;
-    if (!["10-K", "10-Q", "10-K/A", "10-Q/A"].includes(u.form)) continue;
-    const key = `${u.fy}-${u.fp}`;
-    const prev = out.get(key);
-    // Prefer non-amended, then latest filed
-    if (!prev) {
-      out.set(key, u);
-    } else {
-      const prevAmended = prev.form?.endsWith("/A") ? 1 : 0;
-      const curAmended = u.form?.endsWith("/A") ? 1 : 0;
-      if (curAmended < prevAmended) out.set(key, u);
-      else if (curAmended === prevAmended && (u.filed ?? "") > (prev.filed ?? "")) out.set(key, u);
+    if (!unitArr) {
+      const firstKey = Object.keys(node.units)[0];
+      if (firstKey) unitArr = node.units[firstKey];
+    }
+    if (!unitArr) continue;
+    for (const u of unitArr) {
+      const key = `${u.start ?? ""}|${u.end}`;
+      const prev = merged.get(key);
+      if (!prev || (u.filed ?? "") > (prev.filed ?? "")) merged.set(key, u);
     }
   }
-  return out;
+  return [...merged.values()];
 }
 
-// Concept dictionaries — try multiple synonyms because tags vary by filer
+// Concept dictionaries — multiple synonyms because tags vary by filer
 const CONCEPTS = {
   Revenue: [
-    "Revenues",
     "RevenueFromContractWithCustomerExcludingAssessedTax",
+    "Revenues",
     "RevenueFromContractWithCustomerIncludingAssessedTax",
     "SalesRevenueNet",
     "SalesRevenueGoodsNet",
   ],
+  CostOfRevenue: [
+    "CostOfRevenue",
+    "CostOfGoodsAndServicesSold",
+    "CostOfGoodsSold",
+    "CostOfServices",
+  ],
   GrossProfit: ["GrossProfit"],
   OperatingIncome: ["OperatingIncomeLoss"],
-  NetIncome: [
-    "NetIncomeLoss",
-    "ProfitLoss",
-    "NetIncomeLossAvailableToCommonStockholdersBasic",
-  ],
+  NetIncome: ["NetIncomeLoss", "ProfitLoss"],
   NetIncomeToCommon: [
     "NetIncomeLossAvailableToCommonStockholdersBasic",
     "NetIncomeLoss",
@@ -147,16 +150,19 @@ const CONCEPTS = {
   ],
   InterestExpense: ["InterestExpense"],
   IncomeTax: ["IncomeTaxExpenseBenefit"],
-  // Balance sheet
+  // Balance sheet (instant)
   Cash: [
     "CashAndCashEquivalentsAtCarryingValue",
     "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
   ],
   ShortTermInvestments: ["ShortTermInvestments", "MarketableSecuritiesCurrent"],
-  LongTermDebt: ["LongTermDebt", "LongTermDebtNoncurrent"],
+  LongTermDebt: [
+    "LongTermDebtNoncurrent",
+    "LongTermDebt",
+  ],
   ShortTermDebt: [
-    "ShortTermBorrowings",
     "LongTermDebtCurrent",
+    "ShortTermBorrowings",
     "DebtCurrent",
   ],
   TotalAssets: ["Assets"],
@@ -169,8 +175,8 @@ const CONCEPTS = {
   SharesOutstanding: [
     "CommonStockSharesOutstanding",
     "EntityCommonStockSharesOutstanding",
-    "WeightedAverageNumberOfDilutedSharesOutstanding",
   ],
+  WeightedAvgDilutedShares: ["WeightedAverageNumberOfDilutedSharesOutstanding"],
   DividendsPerShare: [
     "CommonStockDividendsPerShareDeclared",
     "CommonStockDividendsPerShareCashPaid",
@@ -178,50 +184,162 @@ const CONCEPTS = {
   DividendsPaid: ["PaymentsOfDividends", "PaymentsOfDividendsCommonStock"],
 };
 
-function ttmSum(units: FactUnit[], end: string, conceptIsFlow = true): number | null {
-  // Sum the last 4 quarterly periods ending at or before `end`
-  if (!conceptIsFlow) {
-    // For point-in-time (balance sheet), just take latest
-    const sorted = [...units].sort((a, b) => (a.end < b.end ? 1 : -1));
-    const pick = sorted.find((u) => u.end <= end) ?? sorted[0];
-    return pick?.val ?? null;
-  }
-  // Find quarterly facts (start defined, ~3 months)
-  const quarters = units
-    .filter((u) => u.start && u.end <= end)
-    .map((u) => {
-      const days = (new Date(u.end).getTime() - new Date(u.start!).getTime()) / 86400000;
-      return { ...u, days };
-    })
-    .filter((u) => u.days > 60 && u.days < 100)
-    .sort((a, b) => (a.end < b.end ? 1 : -1));
+// ---- period classification -------------------------------------------------
 
-  // Dedup by end date — keep latest filed
-  const byEnd = new Map<string, FactUnit & { days: number }>();
-  for (const q of quarters) {
-    const prev = byEnd.get(q.end);
-    if (!prev || (q.filed ?? "") > (prev.filed ?? "")) byEnd.set(q.end, q);
-  }
-  const last4 = [...byEnd.values()]
-    .sort((a, b) => (a.end < b.end ? 1 : -1))
-    .slice(0, 4);
+type PeriodKind = "annual" | "quarterly" | "instant";
 
-  if (last4.length === 0) return null;
-  if (last4.length < 4) {
-    // Try annual fallback
-    const annual = units
-      .filter((u) => u.fp === "FY" && u.end <= end)
-      .sort((a, b) => (a.end < b.end ? 1 : -1));
-    if (annual[0]) return annual[0].val;
-    return null;
-  }
-  return last4.reduce((s, q) => s + q.val, 0);
+function durationDays(start?: string, end?: string): number | null {
+  if (!start || !end) return null;
+  return Math.round(
+    (new Date(end).getTime() - new Date(start).getTime()) / 86400000,
+  );
 }
 
-function pointInTime(units: FactUnit[], end: string): FactUnit | null {
-  const sorted = [...units].sort((a, b) => (a.end < b.end ? 1 : -1));
-  return sorted.find((u) => u.end <= end) ?? sorted[0] ?? null;
+function classify(u: FactUnit): { kind: PeriodKind; days: number | null } {
+  if (!u.start) return { kind: "instant", days: null };
+  const d = durationDays(u.start, u.end)!;
+  if (d >= 350 && d <= 380) return { kind: "annual", days: d };
+  if (d >= 80 && d <= 100) return { kind: "quarterly", days: d };
+  // YTD or other — ignore (we'll re-derive from quarters)
+  return { kind: "annual", days: d }; // mark as annual-ish, then filtered
 }
+
+// Map an end date to a fiscal year + quarter label.
+// We use the calendar year/quarter of the END date — works for ~99% of US filers
+// (calendar fiscal year). For off-cycle fiscal years we still produce a sensible
+// per-quarter label even if "fiscal year" labelling differs slightly.
+function quarterLabelForEnd(end: string): { fy: number; fp: string; label: string } {
+  const d = new Date(end);
+  const y = d.getUTCFullYear();
+  const m = d.getUTCMonth() + 1; // 1-12
+  let q: 1 | 2 | 3 | 4 = 1;
+  if (m <= 3) q = 1;
+  else if (m <= 6) q = 2;
+  else if (m <= 9) q = 3;
+  else q = 4;
+  return { fy: y, fp: `Q${q}`, label: `Q${q} ${y}` };
+}
+
+function annualLabelForEnd(end: string): { fy: number; fp: string; label: string } {
+  const y = new Date(end).getUTCFullYear();
+  return { fy: y, fp: "FY", label: `FY${y}` };
+}
+
+// Bucket facts of a flow concept (revenue, net income, etc.) into:
+// - quarterly buckets keyed by Q?-YYYY (using END date)
+// - annual buckets keyed by FY-YYYY  (using END date)
+// In each bucket pick the most recently filed value (handles restatements / splits).
+function bucketFlow(units: FactUnit[]): {
+  quarterly: Map<string, FactUnit>;
+  annual: Map<string, FactUnit>;
+} {
+  const quarterly = new Map<string, FactUnit>();
+  const annual = new Map<string, FactUnit>();
+
+  for (const u of units) {
+    if (!u.start) continue;
+    const c = classify(u);
+    if (c.kind === "quarterly") {
+      const { fy, fp } = quarterLabelForEnd(u.end);
+      const key = `${fy}-${fp}`;
+      const prev = quarterly.get(key);
+      if (!prev || (u.filed ?? "") > (prev.filed ?? "")) quarterly.set(key, u);
+    } else if (c.kind === "annual" && c.days && c.days >= 350 && c.days <= 380) {
+      const { fy } = annualLabelForEnd(u.end);
+      const key = `${fy}`;
+      const prev = annual.get(key);
+      if (!prev || (u.filed ?? "") > (prev.filed ?? "")) annual.set(key, u);
+    }
+    // YTD (e.g. 6-month, 9-month) ignored — we'll derive Q4 below
+  }
+
+  // Derive Q4 if missing: Q4 = Annual − (Q1+Q2+Q3) (best-effort)
+  for (const [yKey, ann] of annual) {
+    const fy = Number(yKey);
+    const q4Key = `${fy}-Q4`;
+    if (quarterly.has(q4Key)) continue;
+    const q1 = quarterly.get(`${fy}-Q1`);
+    const q2 = quarterly.get(`${fy}-Q2`);
+    const q3 = quarterly.get(`${fy}-Q3`);
+    if (q1 && q2 && q3) {
+      quarterly.set(q4Key, {
+        end: ann.end,
+        start: q3.end, // approximate
+        val: ann.val - q1.val - q2.val - q3.val,
+        form: ann.form,
+        filed: ann.filed,
+      });
+    }
+  }
+
+  return { quarterly, annual };
+}
+
+// Bucket facts of an instant concept (balance sheet) by quarter end + year end.
+function bucketInstant(units: FactUnit[]): {
+  quarterly: Map<string, FactUnit>;
+  annual: Map<string, FactUnit>;
+} {
+  const quarterly = new Map<string, FactUnit>();
+  const annual = new Map<string, FactUnit>();
+  for (const u of units) {
+    if (u.start) continue;
+    const d = new Date(u.end);
+    const m = d.getUTCMonth() + 1;
+    const day = d.getUTCDate();
+    const isQuarterEnd =
+      (m === 3 && day >= 28) ||
+      (m === 6 && day === 30) ||
+      (m === 9 && day === 30) ||
+      (m === 12 && day === 31);
+    if (!isQuarterEnd) continue;
+    const { fy, fp } = quarterLabelForEnd(u.end);
+    const qKey = `${fy}-${fp}`;
+    const qPrev = quarterly.get(qKey);
+    if (!qPrev || (u.filed ?? "") > (qPrev.filed ?? "")) quarterly.set(qKey, u);
+    if (fp === "Q4") {
+      const yKey = `${fy}`;
+      const yPrev = annual.get(yKey);
+      if (!yPrev || (u.filed ?? "") > (yPrev.filed ?? "")) annual.set(yKey, u);
+    }
+  }
+  return { quarterly, annual };
+}
+
+const FLOW_CONCEPTS = new Set([
+  "Revenue",
+  "CostOfRevenue",
+  "GrossProfit",
+  "OperatingIncome",
+  "NetIncome",
+  "NetIncomeToCommon",
+  "OpCashFlow",
+  "CapEx",
+  "DepreciationAmortization",
+  "InterestExpense",
+  "IncomeTax",
+  "DividendsPaid",
+  "DividendsPerShare",
+  "EPSDiluted",
+  "EPSBasic",
+]);
+
+const INSTANT_CONCEPTS = new Set([
+  "Cash",
+  "ShortTermInvestments",
+  "LongTermDebt",
+  "ShortTermDebt",
+  "TotalAssets",
+  "TotalEquity",
+  "CurrentAssets",
+  "CurrentLiabilities",
+  "SharesOutstanding",
+]);
+
+// Note: EPS and DividendsPerShare are per-share *flows* (not summable across
+// quarters in the obvious way — but reported per period in 10-Q/10-K). We treat
+// them like quarterly/annual values and just expose what the filer reports for
+// that period, picking latest-filed (so post-split values win).
 
 function safeDiv(a: number | null, b: number | null): number | null {
   if (a === null || b === null || !isFinite(a) || !isFinite(b) || b === 0) return null;
@@ -250,13 +368,12 @@ Deno.serve(async (req) => {
 
     const resolved = await resolveCik(ticker);
     if (!resolved) {
-      return new Response(JSON.stringify({ error: `Ticker not found in SEC EDGAR: ${ticker}` }), {
-        status: 404,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
+      return new Response(
+        JSON.stringify({ error: `Ticker not found in SEC EDGAR: ${ticker}` }),
+        { status: 404, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      );
     }
 
-    // Fetch company-facts and submissions in parallel
     const [factsRes, subsRes] = await Promise.all([
       secFetch(`https://data.sec.gov/api/xbrl/companyfacts/CIK${resolved.cik}.json`),
       secFetch(`https://data.sec.gov/submissions/CIK${resolved.cik}.json`),
@@ -271,76 +388,179 @@ Deno.serve(async (req) => {
     const facts = (await factsRes.json()) as CompanyFacts;
     const subs = subsRes.ok ? await subsRes.json() : null;
 
-    // ---- Build period-by-period table -------------------------------------
-
+    // Pull raw unit arrays for every concept
     const series: Record<string, FactUnit[]> = {};
     for (const [key, concepts] of Object.entries(CONCEPTS)) {
-      const units = pickUnits(facts, concepts, ["USD", "USD/shares", "shares", "pure"]);
-      series[key] = units;
+      series[key] = pickUnits(facts, concepts, ["USD", "USD/shares", "shares", "pure"]);
     }
 
-    // Determine the universe of (fy, fp) periods from Revenue (most reliable)
-    // Falls back to NetIncome
-    const revGroup = groupPeriods(series.Revenue);
-    const niGroup = groupPeriods(series.NetIncome);
-    const allKeys = new Set<string>([...revGroup.keys(), ...niGroup.keys()]);
+    // Bucket each series
+    const flowBuckets: Record<
+      string,
+      { quarterly: Map<string, FactUnit>; annual: Map<string, FactUnit> }
+    > = {};
+    const instantBuckets: Record<
+      string,
+      { quarterly: Map<string, FactUnit>; annual: Map<string, FactUnit> }
+    > = {};
+
+    for (const k of Object.keys(CONCEPTS)) {
+      if (FLOW_CONCEPTS.has(k)) {
+        flowBuckets[k] = bucketFlow(series[k]);
+      } else if (INSTANT_CONCEPTS.has(k)) {
+        instantBuckets[k] = bucketInstant(series[k]);
+      }
+    }
+
+    // ---- Build period table ---------------------------------------------
+    // Universe of period keys = union across all flow + instant buckets
+
+    const allPeriodKeys = new Set<string>();
+    for (const k of Object.keys(flowBuckets)) {
+      flowBuckets[k].quarterly.forEach((_, kk) => allPeriodKeys.add(`Q:${kk}`));
+      flowBuckets[k].annual.forEach((_, kk) => allPeriodKeys.add(`A:${kk}`));
+    }
+    for (const k of Object.keys(instantBuckets)) {
+      instantBuckets[k].quarterly.forEach((_, kk) => allPeriodKeys.add(`Q:${kk}`));
+      instantBuckets[k].annual.forEach((_, kk) => allPeriodKeys.add(`A:${kk}`));
+    }
 
     const periods: Period[] = [];
-    for (const k of allKeys) {
-      const sample = revGroup.get(k) ?? niGroup.get(k);
-      if (!sample) continue;
-      const fy = sample.fy!;
+    for (const pk of allPeriodKeys) {
+      const isAnnual = pk.startsWith("A:");
+      const rest = pk.slice(2); // "2024" or "2024-Q3"
+      const fy = Number(isAnnual ? rest : rest.split("-")[0]);
       if (fy < startYear || fy > endYear) continue;
-      const fp = sample.fp!;
-      const label = fp === "FY" ? `FY${fy}` : `${fp} ${fy}`;
-      const values: Record<string, number | null> = {};
-      for (const k2 of Object.keys(CONCEPTS)) {
-        const grp = groupPeriods(series[k2]);
-        values[k2] = grp.get(k)?.val ?? null;
+
+      const fp = isAnnual ? "FY" : rest.split("-")[1];
+      const label = isAnnual ? `FY${fy}` : `${fp} ${fy}`;
+
+      // Find a representative end date + form
+      let end = "";
+      let start: string | null = null;
+      let form = "";
+      let filed = "";
+
+      const probeFlow = flowBuckets["Revenue"] ?? flowBuckets["NetIncome"];
+      if (probeFlow) {
+        const u = isAnnual
+          ? probeFlow.annual.get(rest)
+          : probeFlow.quarterly.get(rest);
+        if (u) {
+          end = u.end;
+          start = u.start ?? null;
+          form = u.form ?? "";
+          filed = u.filed ?? "";
+        }
       }
+      if (!end) {
+        // fallback to balance sheet
+        const bs = instantBuckets["TotalAssets"];
+        if (bs) {
+          const u = isAnnual ? bs.annual.get(rest) : bs.quarterly.get(rest);
+          if (u) {
+            end = u.end;
+            form = u.form ?? "";
+            filed = u.filed ?? "";
+          }
+        }
+      }
+
+      const values: Record<string, number | null> = {};
+      for (const k of Object.keys(CONCEPTS)) {
+        const bucket = FLOW_CONCEPTS.has(k) ? flowBuckets[k] : instantBuckets[k];
+        if (!bucket) {
+          values[k] = null;
+          continue;
+        }
+        const u = isAnnual ? bucket.annual.get(rest) : bucket.quarterly.get(rest);
+        values[k] = u?.val ?? null;
+      }
+
       // Derived
+      // Free Cash Flow
       values["FreeCashFlow"] =
         values["OpCashFlow"] !== null && values["CapEx"] !== null
           ? values["OpCashFlow"]! - values["CapEx"]!
           : null;
-      values["GrossMargin"] = safeDiv(values["GrossProfit"], values["Revenue"]);
-      values["OperatingMargin"] = safeDiv(values["OperatingIncome"], values["Revenue"]);
-      values["NetMargin"] = safeDiv(values["NetIncome"], values["Revenue"]);
+      // Gross Profit fallback: Revenue - CostOfRevenue
+      if (values["GrossProfit"] === null && values["Revenue"] !== null && values["CostOfRevenue"] !== null) {
+        values["GrossProfit"] = values["Revenue"]! - values["CostOfRevenue"]!;
+      }
+      // EBITDA = OperatingIncome + D&A
       values["EBITDA"] =
         values["OperatingIncome"] !== null && values["DepreciationAmortization"] !== null
           ? values["OperatingIncome"]! + values["DepreciationAmortization"]!
           : values["OperatingIncome"];
+      // Total Debt
+      values["TotalDebt"] =
+        values["LongTermDebt"] !== null || values["ShortTermDebt"] !== null
+          ? (values["LongTermDebt"] ?? 0) + (values["ShortTermDebt"] ?? 0)
+          : null;
+      // Margins
+      values["GrossMargin"] = safeDiv(values["GrossProfit"], values["Revenue"]);
+      values["OperatingMargin"] = safeDiv(values["OperatingIncome"], values["Revenue"]);
+      values["NetMargin"] = safeDiv(values["NetIncome"], values["Revenue"]);
 
       periods.push({
-        key: k,
+        key: pk,
         label,
         fy,
         fp,
-        end: sample.end,
-        form: sample.form ?? "",
+        end: end || `${fy}-12-31`,
+        start,
+        form,
         values,
       });
     }
-    // sort newest first
+    // Sort newest-first
     periods.sort((a, b) => (a.end < b.end ? 1 : -1));
 
-    // ---- Snapshot ---------------------------------------------------------
+    // ---- Snapshot --------------------------------------------------------
+    // Pick latest QUARTERLY period for MRQ context; latest ANNUAL for FY context.
 
-    // Find latest end date across revenue/netIncome
-    const latestEnd =
-      periods[0]?.end ??
-      [...series.Revenue, ...series.NetIncome]
-        .map((u) => u.end)
-        .sort()
-        .reverse()[0];
+    const latestAnnual = periods.find((p) => p.fp === "FY");
+    const latestQuarter = periods.find((p) => p.fp !== "FY");
+    const latestEnd = latestQuarter?.end ?? latestAnnual?.end ?? null;
 
-    const ttm = (k: keyof typeof CONCEPTS) =>
-      latestEnd ? ttmSum(series[k], latestEnd, true) : null;
-    const pit = (k: keyof typeof CONCEPTS) =>
-      latestEnd ? pointInTime(series[k], latestEnd)?.val ?? null : null;
+    // TTM = sum of latest 4 quarters (regardless of FY boundary)
+    function ttm(conceptKey: string): number | null {
+      const bucket = flowBuckets[conceptKey];
+      if (!bucket) return null;
+      const sortedQ = [...bucket.quarterly.entries()]
+        .sort((a, b) => (a[1].end < b[1].end ? 1 : -1));
+      if (sortedQ.length === 0) {
+        // fallback to latest annual
+        const sortedA = [...bucket.annual.entries()].sort((a, b) =>
+          a[1].end < b[1].end ? 1 : -1,
+        );
+        return sortedA[0]?.[1].val ?? null;
+      }
+      if (sortedQ.length < 4) {
+        const sortedA = [...bucket.annual.entries()].sort((a, b) =>
+          a[1].end < b[1].end ? 1 : -1,
+        );
+        return sortedA[0]?.[1].val ?? null;
+      }
+      return sortedQ.slice(0, 4).reduce((s, [, u]) => s + u.val, 0);
+    }
+
+    function pit(conceptKey: string): number | null {
+      const bucket = instantBuckets[conceptKey];
+      if (!bucket) return null;
+      const merged = [
+        ...bucket.quarterly.values(),
+        ...bucket.annual.values(),
+      ].sort((a, b) => (a.end < b.end ? 1 : -1));
+      return merged[0]?.val ?? null;
+    }
 
     const revenueTTM = ttm("Revenue");
-    const grossProfitTTM = ttm("GrossProfit");
+    const cogsTTM = ttm("CostOfRevenue");
+    let grossProfitTTM = ttm("GrossProfit");
+    if (grossProfitTTM === null && revenueTTM !== null && cogsTTM !== null) {
+      grossProfitTTM = revenueTTM - cogsTTM;
+    }
     const opIncomeTTM = ttm("OperatingIncome");
     const netIncomeTTM = ttm("NetIncome");
     const netIncomeToCommonTTM = ttm("NetIncomeToCommon") ?? netIncomeTTM;
@@ -349,7 +569,6 @@ Deno.serve(async (req) => {
     const capExTTM = ttm("CapEx");
     const daTTM = ttm("DepreciationAmortization");
     const dividendsPaidTTM = ttm("DividendsPaid");
-    const interestExpenseTTM = ttm("InterestExpense");
 
     const cashMRQ = pit("Cash");
     const stInvMRQ = pit("ShortTermInvestments");
@@ -368,38 +587,33 @@ Deno.serve(async (req) => {
     const sharesOutstanding = pit("SharesOutstanding");
     const dividendPerShareTTM = ttm("DividendsPerShare");
 
-    // EBITDA TTM
     const ebitdaTTM =
       opIncomeTTM !== null && daTTM !== null ? opIncomeTTM + daTTM : opIncomeTTM;
 
     // Quarterly YoY growth
-    const quarterlyOf = (units: FactUnit[]) => {
-      return units
-        .filter((u) => u.start && u.end)
-        .map((u) => {
-          const days = (new Date(u.end).getTime() - new Date(u.start!).getTime()) / 86400000;
-          return { ...u, days };
-        })
-        .filter((u) => u.days > 60 && u.days < 100);
-    };
-    const latestQ = quarterlyOf(series.Revenue).sort((a, b) => (a.end < b.end ? 1 : -1))[0];
-    let revQYoY: number | null = null;
-    if (latestQ) {
-      const prevYearQ = quarterlyOf(series.Revenue).find(
-        (u) => Math.abs(new Date(u.end).getTime() - new Date(latestQ.end).getTime() - 365 * 86400000) < 30 * 86400000,
+    function quarterlyYoY(conceptKey: string): number | null {
+      const bucket = flowBuckets[conceptKey];
+      if (!bucket) return null;
+      const sortedQ = [...bucket.quarterly.values()].sort((a, b) =>
+        a.end < b.end ? 1 : -1,
       );
-      if (prevYearQ && prevYearQ.val) revQYoY = (latestQ.val - prevYearQ.val) / prevYearQ.val;
-    }
-    const latestQNI = quarterlyOf(series.NetIncome).sort((a, b) => (a.end < b.end ? 1 : -1))[0];
-    let niQYoY: number | null = null;
-    if (latestQNI) {
-      const prevYearQ = quarterlyOf(series.NetIncome).find(
-        (u) => Math.abs(new Date(u.end).getTime() - new Date(latestQNI.end).getTime() - 365 * 86400000) < 30 * 86400000,
+      const latest = sortedQ[0];
+      if (!latest) return null;
+      const targetEnd = new Date(latest.end);
+      targetEnd.setUTCFullYear(targetEnd.getUTCFullYear() - 1);
+      const prev = sortedQ.find(
+        (u) =>
+          Math.abs(new Date(u.end).getTime() - targetEnd.getTime()) <
+          20 * 86400000,
       );
-      if (prevYearQ && prevYearQ.val) niQYoY = (latestQNI.val - prevYearQ.val) / prevYearQ.val;
+      if (!prev || prev.val === 0) return null;
+      return (latest.val - prev.val) / prev.val;
     }
 
-    // Recent submissions (10-K, 8-K, DEF 14A)
+    const revQYoY = quarterlyYoY("Revenue");
+    const niQYoY = quarterlyYoY("NetIncome");
+
+    // Recent submissions
     type FilingMeta = {
       form: string;
       filed: string;
@@ -424,23 +638,18 @@ Deno.serve(async (req) => {
           filed,
           reportDate,
           accession: acc,
-          url: `https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=${cikInt}&type=${encodeURIComponent(form)}&dateb=&owner=include&count=40`,
+          url: `https://www.sec.gov/Archives/edgar/data/${cikInt}/${accNoDash}/${acc}-index.htm`,
         });
-        // also direct filing url
-        filings[filings.length - 1].url = `https://www.sec.gov/Archives/edgar/data/${cikInt}/${accNoDash}/${acc}-index.htm`;
       }
     }
-
-    // Last 8-K mentioning a stock split / dividend declaration — best-effort: just expose latest 8-Ks; full text parse skipped.
+    const recent10K = filings.filter((f) => f.form === "10-K").slice(0, 5);
     const recent8K = filings.filter((f) => f.form === "8-K").slice(0, 10);
     const recentDEF14A = filings.filter((f) => f.form === "DEF 14A").slice(0, 3);
-    const recent10K = filings.filter((f) => f.form === "10-K").slice(0, 5);
 
     const mostRecent10K = recent10K[0];
     const fiscalYearEnd = mostRecent10K?.reportDate ?? null;
     const fiscalYear = fiscalYearEnd ? Number(fiscalYearEnd.slice(0, 4)) : null;
 
-    // Snapshot
     const snapshot = {
       ticker,
       entityName: resolved.name,
@@ -448,17 +657,13 @@ Deno.serve(async (req) => {
       latestEnd,
       fiscalYear,
       fiscalYearEnd,
-      mostRecentQuarterEnd: latestEnd,
+      mostRecentQuarterEnd: latestQuarter?.end ?? null,
 
-      // Profitability
       profitMargin: safeDiv(netIncomeTTM, revenueTTM),
       operatingMargin: safeDiv(opIncomeTTM, revenueTTM),
-
-      // Mgmt Effectiveness
       returnOnAssets: safeDiv(netIncomeTTM, totalAssetsMRQ),
       returnOnEquity: safeDiv(netIncomeToCommonTTM, totalEquityMRQ),
 
-      // Income Statement
       revenueTTM,
       revenuePerShareTTM: safeDiv(revenueTTM, sharesOutstanding),
       quarterlyRevenueGrowthYoY: revQYoY,
@@ -468,7 +673,6 @@ Deno.serve(async (req) => {
       dilutedEPSTTM: epsDilutedTTM,
       quarterlyEarningsGrowthYoY: niQYoY,
 
-      // Balance Sheet
       totalCashMRQ,
       totalCashPerShareMRQ: safeDiv(totalCashMRQ, sharesOutstanding),
       totalDebtMRQ,
@@ -477,33 +681,22 @@ Deno.serve(async (req) => {
       currentRatioMRQ: safeDiv(currentAssetsMRQ, currentLiabMRQ),
       bookValuePerShareMRQ: safeDiv(totalEquityMRQ, sharesOutstanding),
 
-      // Cash Flow
       operatingCashFlowTTM: ocfTTM,
-      // Levered FCF ≈ OCF − CapEx (approximation; true levered also subtracts mandatory debt repayments)
       leveredFreeCashFlowTTM:
         ocfTTM !== null && capExTTM !== null ? ocfTTM - capExTTM : null,
 
-      // Share Stats
       sharesOutstanding,
-      // Insider % is in DEF 14A (text), not XBRL — we expose a link instead.
 
-      // Dividends
-      forwardAnnualDividendRate: dividendPerShareTTM, // approx using TTM declared
+      forwardAnnualDividendRate: dividendPerShareTTM,
       trailingAnnualDividendRate: dividendPerShareTTM,
       payoutRatio: safeDiv(dividendsPaidTTM, netIncomeTTM),
-      // Last dividend date / ex-dividend date / split factor / split date come from 8-K text;
-      // we expose the latest 8-K filings list for the user to inspect.
     };
 
     return new Response(
       JSON.stringify({
         snapshot,
         periods,
-        filings: {
-          recent10K,
-          recent8K,
-          recentDEF14A,
-        },
+        filings: { recent10K, recent8K, recentDEF14A },
       }),
       { headers: { ...corsHeaders, "Content-Type": "application/json" } },
     );
