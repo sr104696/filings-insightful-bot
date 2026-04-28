@@ -35,9 +35,12 @@ const SECTIONS: { title: string; rows: Row[] }[] = [
     title: "Balance Sheet",
     rows: [
       { key: "Cash", label: "Cash & Equivalents", format: "money" },
+      { key: "CurrentAssets", label: "Current Assets", format: "money" },
+      { key: "CurrentLiabilities", label: "Current Liabilities", format: "money" },
       { key: "TotalAssets", label: "Total Assets", format: "money" },
       { key: "TotalEquity", label: "Total Equity", format: "money" },
       { key: "LongTermDebt", label: "Long-Term Debt", format: "money" },
+      { key: "TotalDebt", label: "Total Debt", format: "money" },
       { key: "SharesOutstanding", label: "Shares Outstanding", format: "money" },
     ],
   },
