@@ -75,6 +75,10 @@ async function resolveCik(ticker: string): Promise<{ cik: string; name: string }
   return null;
 }
 
+// Merge units from ALL matching concept synonyms — filers sometimes switch
+// tags between filings (e.g. Alphabet moved from
+// RevenueFromContractWithCustomerExcludingAssessedTax to Revenues mid-2025).
+// Dedup by (start|end) keeping the most recently filed value.
 function pickUnits(
   facts: CompanyFacts,
   conceptCandidates: string[],
@@ -82,16 +86,29 @@ function pickUnits(
 ): FactUnit[] {
   const ns = facts.facts["us-gaap"] ?? {};
   const dei = facts.facts.dei ?? {};
+  const merged = new Map<string, FactUnit>();
   for (const c of conceptCandidates) {
     const node = ns[c] ?? dei[c];
     if (!node) continue;
+    let unitArr: FactUnit[] | undefined;
     for (const u of preferredUnits) {
-      if (node.units[u]) return node.units[u];
+      if (node.units[u]) {
+        unitArr = node.units[u];
+        break;
+      }
     }
-    const firstKey = Object.keys(node.units)[0];
-    if (firstKey) return node.units[firstKey];
+    if (!unitArr) {
+      const firstKey = Object.keys(node.units)[0];
+      if (firstKey) unitArr = node.units[firstKey];
+    }
+    if (!unitArr) continue;
+    for (const u of unitArr) {
+      const key = `${u.start ?? ""}|${u.end}`;
+      const prev = merged.get(key);
+      if (!prev || (u.filed ?? "") > (prev.filed ?? "")) merged.set(key, u);
+    }
   }
-  return [];
+  return [...merged.values()];
 }
 
 // Concept dictionaries — multiple synonyms because tags vary by filer
